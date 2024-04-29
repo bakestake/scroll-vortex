@@ -1,0 +1,217 @@
+// SPDX-License-Identifier: MIT
+pragma solidity 0.8.20;
+
+import { Ownable } from "@openzeppelin/contracts/access/Ownable.sol";
+import { IERC20 } from "@openzeppelin/contracts/token/ERC20/IERC20.sol";
+import { IRewardPool } from "./IRewardPool.sol";
+import { EnumerableSet } from "@openzeppelin/contracts/utils/structs/EnumerableSet.sol";
+
+
+contract StakeAndRaid is Ownable {
+    error ZeroAddress(string);
+    error NotStaked();
+    error InsufficientStake();
+    error InvalidAPR();
+    error StakingNotStarted();
+    error StakingNotEnded();
+    error InsufficientbudsBalance();
+    error MinimumStakeDurationNotElapsed();
+
+    using EnumerableSet for EnumerableSet.AddressSet;
+
+    struct Stake {
+        uint256 stakedBudsAmount;
+        uint256 stakeTimestamp;
+        uint256 rewards;
+    }
+
+    /**
+     * @param userAddress address of interacting user
+     * @param amountStaked amount staked by the user
+     */
+    event Staked(address indexed userAddress, uint256 amountStaked);
+
+    /**
+     * @param userAddress address of interacting user
+     * @param amountUnstaked amount unstaked by the user
+     */
+    event Unstake(address indexed userAddress, uint256 amountUnstaked);
+
+    /**
+     * @param userAddress address of interacting user
+     * @param rewardsClaimed amount of rewards claimed by the user
+     */
+    event RewardClaimed(address indexed userAddress, uint256 rewardsClaimed);
+
+
+    event Raided(address raider, bool success);
+
+    /// buds token & pool interface instance
+    IERC20 public _budsToken;
+    IRewardPool public _rewardPool;
+
+    /// variable to toggle state of staking and claims
+    bool public lock;
+
+    /// APR rate[annual percentage rate of rewards for staking]
+    uint64 public _aprRate;
+
+    /// total staked buds tokens by all user
+    uint256 public _totalstakedBudsAmount;
+
+    /// individual staker's stake record
+    mapping(address stakeHobudser => Stake stake) public _stakeByUser;
+
+    /// addresses of all stake hobudsers
+    EnumerableSet.AddressSet private _stakeHobudsers;
+
+    /**
+     *
+     * @param aprRate reward rate with extra 2 decimals eg 50% as 5000
+     * @param owner owner
+     * @param budsTokenAddress buds token address
+     */
+    constructor(uint64 aprRate, address owner, address budsTokenAddress) Ownable(owner) {
+        if (budsTokenAddress == address(0)) revert ZeroAddress("buds token address can't be zero");
+        if (aprRate < 100) revert InvalidAPR();
+        _budsToken = IERC20(budsTokenAddress);
+        _aprRate = aprRate;
+        lock = true;
+    }
+
+    /**
+     * @notice This function opens staking for users
+     * @dev Can only be called by owner
+     */
+    function enableStaking() external onlyOwner {
+        lock = false;
+    }
+
+    function disableStaking() external onlyOwner {
+        lock = true;
+    }
+
+    /**
+     * @notice This function sets the address for new pool contract
+     * @dev Can only be called by owner
+     * @param newPoolAddress Address of new pool contract
+     */
+    function setPool(address newPoolAddress) external onlyOwner {
+        if (newPoolAddress == address(0)) revert ZeroAddress("Pool address can't be zero");
+        _rewardPool = IRewardPool(newPoolAddress);
+    }
+
+    /**
+     * @notice This function changes the APR rate
+     * @dev Can only be called by owner
+     * @param newApr New APR rate
+     */
+    function changeApr(uint8 newApr) external onlyOwner {
+        if (newApr < 100) revert InvalidAPR();
+        _aprRate = newApr;
+    }
+
+    /**
+     * @notice This function returns amount of buds tokens staked by user
+     * @param _stakeHobudser address of stake hobudser
+     */
+    function getstakedBudsAmountBy(address _stakeHobudser) external view returns (uint256) {
+        return _stakeByUser[_stakeHobudser].stakedBudsAmount;
+    }
+
+    /**
+     * @notice This function handles both cases of staking buds token first time and adding to exisiting stake
+     * @param amount Amount of buds tokens to be staked by user
+     */
+    function stakebuds(uint256 amount) external {
+        if (lock) revert StakingNotStarted();
+
+        Stake memory newStake;
+        if (_stakeHobudsers.contains(_msgSender())) {
+            newStake = _stakeByUser[_msgSender()];
+        } else {
+            newStake = Stake({ stakedBudsAmount: 0, stakeTimestamp: block.timestamp, rewards: 0 });
+            _stakeHobudsers.add(_msgSender());
+        }
+        newStake.stakedBudsAmount += amount;
+        _totalstakedBudsAmount += amount;
+        _stakeByUser[_msgSender()] = newStake;
+
+        _budsToken.transferFrom(_msgSender(), address(this), amount);
+        emit Staked(_msgSender(), amount);
+    }
+
+    function raidPool() external payable {
+        require(msg.value >= 0.0005 ether, "Insufficient fees");
+        uint256 randNo = uint256(
+            keccak256(
+                abi.encodePacked(blockhash(block.number), block.timestamp)
+            )
+        );
+
+        randNo = randNo%2;
+        if(randNo == 0){
+            _rewardPool.sendRewards(1000 ether, _msgSender());
+            emit Raided(_msgSender(), true);
+        }else{
+            emit Raided(_msgSender(), false);
+        }
+        
+    }
+
+    /**
+     * @notice This function can be used to fully or partially unstake buds tokens
+     * @param amount Amount of buds tokens to be unstaked
+     */
+    function unstakebuds(uint256 amount) external {
+        Stake memory userStake = _stakeByUser[_msgSender()];
+        if (!_stakeHobudsers.contains(_msgSender())) revert NotStaked();
+        if (userStake.stakedBudsAmount < amount) revert InsufficientStake();
+        if (!lock) revert StakingNotEnded();
+
+        userStake.stakedBudsAmount -= amount;
+        _totalstakedBudsAmount -= amount;
+        if (userStake.stakedBudsAmount == 0) {
+            delete _stakeByUser[_msgSender()];
+            _stakeHobudsers.remove(_msgSender());
+        }
+
+        _budsToken.transfer(_msgSender(), amount);
+        emit Unstake(_msgSender(), amount);
+    }
+
+    /**
+     * @notice Function for claiming weekly rewards
+     * @dev Can only be called when claims are open
+     */
+    function claimRewards() external {
+        Stake memory userStake = _stakeByUser[_msgSender()];
+        if (!_stakeHobudsers.contains(_msgSender())) revert NotStaked();
+        if (block.timestamp - userStake.stakeTimestamp < 300 seconds) revert MinimumStakeDurationNotElapsed();
+
+        uint256 rewardAmount = calculateRewards(userStake);
+        userStake.stakeTimestamp = block.timestamp;
+
+        delete _stakeByUser[_msgSender()];
+        _stakeByUser[_msgSender()] = userStake;
+        _rewardPool.sendRewards(rewardAmount, _msgSender());
+        emit RewardClaimed(_msgSender(), rewardAmount);
+    }
+
+    function withDrawFees(address _to) external onlyOwner{
+        (bool sent, bytes memory data) = _to.call{value: address(this).balance}("");
+        require(sent, "Failed to send Ether");
+    }
+
+    /**
+     * @notice function responsible for calculating rewards for number of days user staked buds
+     * @param userStake Stake record of user
+     */
+    function calculateRewards(Stake memory userStake) internal view returns (uint256 rewards) {
+        rewards = (_aprRate * userStake.stakedBudsAmount) / 10000;
+    }
+
+    receive() external payable { }
+
+    fallback() external payable { }
+}
